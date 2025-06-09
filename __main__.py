@@ -44,11 +44,11 @@ log_policy_attachment = aws.iam.RolePolicyAttachment("stockApiLambdaLogPolicyAtt
 
 # 1. Create the deployment package (zip file)
 # Pulumi can automatically zip a directory.
-lambda_asset_archive = pulumi.FileArchive("../broker-backend/deployment_package.zip") # Points to the directory with your lambda_function.py and its requirements.txt
+lambda_asset_archive = pulumi.FileArchive("../broker-backend/deploy.zip") # Points to the directory with your lambda_function.py and its requirements.txt
 
-stock_api_lambda = aws.lambda_.Function("stockApiFunction",
+stock_api_lambda = aws.lambda_.Function("BrokerBackendFunction",
     role=lambda_role.arn,
-    runtime="python3.9",  # Match your Lambda function's Python version
+    runtime="python3.9",  
     handler="broker.lambda_handler", # filename.handler_function
     code=lambda_asset_archive,
     timeout=10,  # Seconds, adjust as needed
