@@ -1,2 +1,3 @@
 config:
   aws:region: ap-southeast-1
+  aws-native:region: ap-southeast-1

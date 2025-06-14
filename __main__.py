@@ -12,9 +12,6 @@ import os
 # finnhub_api_key = config.require_secret("finnhubApiKey")
 # For this example, we'll assume it's set as an environment variable for the Pulumi process
 # or you can hardcode it during testing (not recommended for production)
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY_FOR_PULUMI")
-if not FINNHUB_API_KEY:
-    raise Exception("FINNHUB_API_KEY_FOR_PULUMI environment variable not set for Pulumi deployment.")
 
 # --- IAM Role for Lambda ---
 lambda_role = aws.iam.Role("stockApiLambdaRole",
@@ -37,6 +34,45 @@ log_policy_attachment = aws.iam.RolePolicyAttachment("stockApiLambdaLogPolicyAtt
     role=lambda_role.name,
     policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole")
 
+# --- DynamoDB Table ---
+dynamodb_table = aws.dynamodb.Table("brokerDataTable",
+    attributes=[
+        aws.dynamodb.TableAttributeArgs(
+            name="id", # Primary key attribute name
+            type="S",  # S for String, N for Number, B for Binary
+        ),
+        aws.dynamodb.TableAttributeArgs(
+            name="symbol", # Sort key attribute name
+            type="S",     # S for String
+        ),
+    ],
+    hash_key="id", # The name of the attribute to use as the hash key (partition key)
+    range_key="symbol", # The name of the attribute to use as the range key (sort key)
+    billing_mode="PROVISIONED", # Changed from PAY_PER_REQUEST
+    read_capacity=5,  # Free tier eligible (e.g., 5 RCUs)
+    write_capacity=5, # Free tier eligible (e.g., 5 WCUs)
+    tags={
+        "Name": "broker-data-table",
+        "Project": "Bro-Ker",
+    })
+
+# --- IAM Policy for Lambda to access DynamoDB ---
+dynamodb_lambda_policy = aws.iam.Policy("stockApiLambdaDynamoDbPolicy",
+    description="IAM policy for Lambda to read/write from the Broker DynamoDB table",
+    policy=dynamodb_table.arn.apply(lambda arn: json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Scan", "dynamodb:Query"],
+            "Effect": "Allow",
+            "Resource": arn, # Grant access to the specific table
+        }]
+    })))
+
+# Attach the DynamoDB access policy to the Lambda role
+dynamodb_policy_attachment = aws.iam.RolePolicyAttachment("stockApiLambdaDynamoDbAttachment",
+    role=lambda_role.name,
+    policy_arn=dynamodb_lambda_policy.arn)
+
 # --- Lambda Function ---
 # Create a Lambda layer for dependencies if you have many or large ones.
 # For a single small dependency like finnhub-python, zipping it with the code is often fine.
@@ -55,14 +91,59 @@ stock_api_lambda = aws.lambda_.Function("BrokerBackendFunction",
     memory_size=128, # MB
     environment=aws.lambda_.FunctionEnvironmentArgs(
         variables={
-            "FINNHUB_API_KEY": FINNHUB_API_KEY,
+            "FINNHUB_API_KEY": "null",
+            "COGNITO_TOKEN_ENDPOINT": "null",
+            "COGNITO_CLIENT_ID": "null",
+            "COGNITO_CLIENT_SECRET": "null",
+            "DYNAMODB_TABLE_NAME": dynamodb_table.name, # Pass table name to Lambda
             # Add any other environment variables your Lambda needs
         },
     ),
     tags={
         "Name": "stock-api-function",
         "Project": "Bro-Ker",
+    },
+    opts=pulumi.ResourceOptions(ignore_changes=["code", "environment"])
+    )  # Ignore changes to the code, so it doesn't trigger redeployments unnecessarily
+    
+
+## NEW ## --- Cognito User Pool for Authentication ---
+
+# 1. Create the User Pool
+user_pool = aws.cognito.UserPool("brokerUserPool",
+    name="BrokerAppUserPool",
+    # Configure password policy, etc. as needed
+    password_policy=aws.cognito.UserPoolPasswordPolicyArgs(
+        minimum_length=8,
+        require_lowercase=True,
+        require_numbers=True,
+        require_symbols=True,
+        require_uppercase=True,
+    ),
+    # Require email for user accounts and auto-verify it
+    auto_verified_attributes=["email"],
+    tags={
+        "Name": "broker-user-pool",
     })
+
+# 2. Create the User Pool Client
+# This is what your frontend application will use to interact with Cognito.
+user_pool_client = aws.cognito.UserPoolClient("brokerUserPoolClient",
+    name="BrokerAppClient",
+    user_pool_id=user_pool.id,
+    # Set to False because client-side apps (like a browser SPA) can't securely store a secret.
+    generate_secret=True,
+    # Define authentication flows. USER_PASSWORD_AUTH is for direct user/pass login.
+    # REFRESH_TOKEN_AUTH allows the app to get new tokens without the user logging in again.
+    explicit_auth_flows=[
+        "ALLOW_USER_PASSWORD_AUTH",
+        "ALLOW_REFRESH_TOKEN_AUTH",
+        "ALLOW_ADMIN_USER_PASSWORD_AUTH"
+    ],
+    # You would configure these with your actual frontend URLs
+    callback_urls=["https://bro-ker.com/callback"],
+    logout_urls=["https://bro-ker.com/logout"],
+    )
 
 # --- API Gateway (HTTP API v2) ---
 # Create an HTTP API
@@ -70,11 +151,11 @@ http_api = aws_native.apigatewayv2.Api("stockHttpApi",
     name="StockBrokerHttpApi",
     protocol_type="HTTP",
     description="API for Bro-Ker stock information",
-    target=stock_api_lambda.invoke_arn,  # Directly set the Lambda function ARN as the target
+    #target=stock_api_lambda.invoke_arn,  # Directly set the Lambda function ARN as the target
     # Corrected CORS Configuration using a dictionary:
     cors_configuration={ 
         "allowOrigins": ["https://bro-ker.com", "http://localhost:5500", "http://127.0.0.1:5500"],
-        "allowMethods": ["GET", "OPTIONS"],
+        "allowMethods": ["GET", "OPTIONS","POST", "PUT", "DELETE"],
         "allowHeaders": ["Content-Type", "X-Amz-Date", "Authorization", "X-Api-Key", "X-Amz-Security-Token"],
         "maxAge": 300,
     },
@@ -116,35 +197,120 @@ api_mapping = aws_native.apigatewayv2.ApiMapping("bro-ker-apiMapping",
     #api_mapping_key='v1' #not so sophisticated yet
 )
 
+jwt_authorizer = aws_native.apigatewayv2.Authorizer("brokerJwtAuthorizer",
+    api_id=http_api.id,
+    name="CognitoJwtAuthorizer",
+    authorizer_type="JWT",
+    # Where to find the token in the incoming request
+    identity_source=["$request.header.Authorization"],
+    # Configure the authorizer to use our Cognito User Pool
+    jwt_configuration=aws_native.apigatewayv2.AuthorizerJwtConfigurationArgs(
+        # The 'audience' must match the 'client ID' of your User Pool Client
+        audience=[user_pool_client.id],
+        # The 'issuer' URL for your User Pool
+        issuer=user_pool.id.apply(
+            lambda pool_id: f"https://cognito-idp.{aws.get_region().name}.amazonaws.com/{pool_id}"
+        ),
+    ))
+
+
+
 # Create Lambda integration for API Gateway
 lambda_integration = aws_native.apigatewayv2.Integration("bro-ker-backend",
     api_id=http_api.id,
     integration_type="AWS_PROXY",
     integration_uri=stock_api_lambda.invoke_arn,
-    payload_format_version="2.0"
+    payload_format_version="2.0",
+    # --- Request Parameter Mapping ---
+    # This section demonstrates how to map request data to the integration.
+    # For AWS_PROXY with Lambda, these mapped parameters become part of the 'event'
+    # object received by the Lambda function.
+    request_parameters={
+        # This maps the 'sub' (subject/user ID) claim from the JWT authorizer
+        # Your Lambda function can then access this via event['queryStringParameters']['userIdAuth'].
+        "overwrite:querystring.userIdAuth": "$context.authorizer.claims.sub",
+
+        # You could also map other things, e.g., a static value or another request part:
+        # "overwrite:querystring.staticValue": "'bro-ker-api-source'", # Static string value
+        # "overwrite:header.X-Mapped-Header": "$request.header.Some-Client-Header" # Map a client header
+    },
+    # If updating the integration (e.g., by adding request_parameters) fails due to
+    # "required key [IntegrationType] not found", it might be a provider issue
+    # with how it handles updates. Forcing a replacement when request_parameters
+    # changes can be a workaround.
+    opts=pulumi.ResourceOptions(
+        replace_on_changes=["request_parameters"]
+    ))
+
+
+# A helper function to format the target ARN correctly
+def format_integration_target(integration_id_output):
+    return integration_id_output.apply(
+        lambda composite_id: f"integrations/{composite_id.split('|')[1]}" if isinstance(composite_id, str) and '|' in composite_id else "integrations/error-invalid-id-format"
+    )
+
+
+# --- API Routes with Authentication ---
+# Create routes for the API
+auth_profile_route = aws_native.apigatewayv2.Route("authProfileRoute",
+    api_id=http_api.id,
+    route_key="GET /api/auth", # A new path for authenticated users
+    target=format_integration_target(lambda_integration.id),
+    opts=pulumi.ResourceOptions(
+        replace_on_changes=["target"],
+        delete_before_replace=True
+    )
 )
 
-
-pulumi.export("lambda_integration_id", lambda_integration.id)
-
-# Create routes for the API
+# ## MODIFIED ## --- Update existing routes to be protected ---
 quotes_route = aws_native.apigatewayv2.Route("stockQuotesRoute",
     api_id=http_api.id,
     route_key="GET /api/stock-quotes",
-    # Corrected target by splitting the composite ID
-    target=lambda_integration.id.apply(
-        lambda composite_id: f"integrations/{composite_id.split('|')[1]}" if isinstance(composite_id, str) and '|' in composite_id else "integrations/error-invalid-id-format"
+    target=format_integration_target(lambda_integration.id),
+    authorization_type="JWT", # Protect this route
+    authorizer_id=jwt_authorizer.authorizer_id, # Link to the authorizer (use .authorizer_id for aws_native)
+    opts=pulumi.ResourceOptions(
+        replace_on_changes=["target"],
+        delete_before_replace=True
     )
 )
 
 news_route = aws_native.apigatewayv2.Route("stockNewsRoute",
     api_id=http_api.id,
     route_key="GET /api/company-news",
-    # Corrected target by splitting the composite ID
-    target=lambda_integration.id.apply(
-        lambda composite_id: f"integrations/{composite_id.split('|')[1]}" if isinstance(composite_id, str) and '|' in composite_id else "integrations/error-invalid-id-format"
+    target=format_integration_target(lambda_integration.id),
+    authorization_type="JWT", # Protect this route
+    authorizer_id=jwt_authorizer.authorizer_id, # Link to the authorizer
+    opts=pulumi.ResourceOptions(
+        replace_on_changes=["target"],
+        delete_before_replace=True
     )
 )
+
+portfolio_get_route = aws_native.apigatewayv2.Route("portfolioGetRoute",
+    api_id=http_api.id,
+    route_key="GET /api/portfolio", # New route for portfolio
+    target=format_integration_target(lambda_integration.id),
+    authorization_type="JWT", # Protect this route
+    authorizer_id=jwt_authorizer.authorizer_id, # Link to the authorizer
+    opts=pulumi.ResourceOptions(
+        replace_on_changes=["target"],
+        delete_before_replace=True
+    )
+)
+
+portfolio_post_route = aws_native.apigatewayv2.Route("portfolioPostRoute",
+    api_id=http_api.id,
+    route_key="POST /api/portfolio", # POST method for portfolio
+    target=format_integration_target(lambda_integration.id),
+    authorization_type="JWT", # Protect this route
+    authorizer_id=jwt_authorizer.authorizer_id, # Link to the authorizer
+    opts=pulumi.ResourceOptions(
+        replace_on_changes=["target"],
+        delete_before_replace=True
+    )
+)
+
 # API Gateway automatically creates a default stage named '$default' for HTTP APIs
 # and the invoke URL is directly available.
 
@@ -175,4 +341,9 @@ pulumi.export("lambda_function_name", stock_api_lambda.name)
 pulumi.export("lambda_function_arn", stock_api_lambda.arn)
 pulumi.export("lambda_role_arn", lambda_role.arn)
 pulumi.export("api_gateway_id", http_api.id)
+pulumi.export("dynamodb_table_name", dynamodb_table.name)
 pulumi.export("api_gateway_invoke_url", http_api.api_endpoint) # This is the base URL for your API
+
+## NEW ## --- Add Cognito outputs for your frontend app ---
+pulumi.export("cognito_user_pool_id", user_pool.id)
+pulumi.export("cognito_user_pool_client_id", user_pool_client.id)
